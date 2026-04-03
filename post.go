@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -19,15 +20,12 @@ import (
 // the caller to serve 9P on.  9pserve multiplexes client connections from
 // the Unix socket onto the pipe.
 //
-// The cleanup function closes the parent end; 9pserve receives EOF and
-// exits, removing the socket file it owns.
+// Post blocks until 9pserve has created the socket, so the service is
+// immediately reachable by clients upon return.
 //
-// Typical usage:
-//
-//	rw, cleanup, err := p9srv.Post("mysvc")
-//	if err != nil { log.Fatal(err) }
-//	defer cleanup()
-//	myServer.Serve(rw)
+// The cleanup function performs an inode-safe removal of the socket and then
+// closes the pipe; 9pserve receives EOF and exits.  Cleanup is synchronous:
+// it returns only after 9pserve has fully exited.
 func Post(name string) (io.ReadWriteCloser, func(), error) {
 	path := ServicePath(name)
 	os.Remove(path) // remove stale socket from a previous run
@@ -57,8 +55,26 @@ func Post(name string) (io.ReadWriteCloser, func(), error) {
 	}
 	child.Close() // parent holds the only remaining reference to its end
 
+	// Block until 9pserve creates the socket so callers can connect
+	// immediately after Post returns.
+	if err := waitSocket(path, 5*time.Second); err != nil {
+		parent.Close()
+		cmd.Wait() //nolint:errcheck
+		return nil, nil, err
+	}
+
+	// Capture the inode now so cleanup can remove the socket safely.  We
+	// remove it ourselves rather than relying on 9pserve's atexit handler,
+	// which runs asynchronously relative to cmd.Wait.  The inode check
+	// prevents a dying old instance from removing a replacement socket
+	// created by a newer one.
+	ino := socketIno(path)
+
 	cleanup := func() {
-		parent.Close() // 9pserve gets EOF and exits, removing the socket
+		if ino != 0 && socketIno(path) == ino {
+			os.Remove(path)
+		}
+		parent.Close() // 9pserve gets EOF on stdin and exits
 		cmd.Wait()     //nolint:errcheck
 	}
 	return parent, cleanup, nil
